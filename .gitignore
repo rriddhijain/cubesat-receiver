@@ -1,0 +1,34 @@
+# Python cache / build
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Datasets & challenge files
+*.npy
+*.json
+datasets/
+data/
+mnt/
+outputs/
+plots/
+
+# Logs & reports
+*.log
+*.out
+*.err
+*.tmp
+
+# IDE / editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS junk
+.DS_Store
+Thumbs.db
