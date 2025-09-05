@@ -1,42 +1,39 @@
 #!/usr/bin/env python3
+"""
+main.py - Unified pipeline for CubeSat communication challenge (phases 1..4)
+
+Usage:
+    python main.py --phase 3 --log-level INFO
+"""
 import argparse
+import json
 import logging
 from pathlib import Path
-import json
 import numpy as np
 
-# Project imports (assumed to exist)
+# Project imports (expected present in your repo)
 from config import Config
 from receiver.demodulator import BPSKDemodulator
 from evaluation.metrics import calculate_ber
 from evaluation.plotting import plot_constellation
 
-# Phase 3 integration
+# Phase 3 integration (your existing module)
 from cubesat_dataset.phase3_coding.integration import run_phase3_on_sample
 
-
 # -------------------------
-# Helpers: inference / alignment
+# Helpers: canonical mapping, alignment
 # -------------------------
 CANONICAL_MAP = {
-    'conv': 'conv',
-    'convolutional': 'conv',
-    'convolutional_viterbi': 'conv',
-    'viterbi': 'conv',
-    'convolutional-viterbi': 'conv',
-    'conv_viterbi': 'conv',
-    'rs': 'rs',
-    'reed_solomon': 'rs',
-    'reed-solomon': 'rs',
-    'reedsolomon': 'rs',
-    'reed': 'rs'
+    'conv': 'conv', 'convolutional': 'conv', 'viterbi': 'conv', 'conv_viterbi': 'conv',
+    'rs': 'rs', 'reed_solomon': 'rs', 'reedsolomon': 'rs', 'reed': 'rs'
 }
 
 
 def infer_and_fix_coding(sample_dir: Path, sample_data: dict, write_back=True):
-    keys_to_check = ['coding', 'coding_name', 'coding-type', 'codec', 'code']
+    """Infer canonical coding label ('conv' or 'rs') from meta or path; optionally write meta.json."""
+    keys = ['coding', 'coding_name', 'coding-type', 'codec', 'code']
     val = None
-    for k in keys_to_check:
+    for k in keys:
         if k in sample_data and sample_data.get(k) is not None:
             val = str(sample_data.get(k)).strip().lower()
             if val:
@@ -47,7 +44,7 @@ def infer_and_fix_coding(sample_dir: Path, sample_data: dict, write_back=True):
         if meta_path.exists():
             try:
                 meta = json.loads(meta_path.read_text())
-                for k in keys_to_check:
+                for k in keys:
                     if k in meta and meta.get(k):
                         val = str(meta.get(k)).strip().lower()
                         break
@@ -55,14 +52,12 @@ def infer_and_fix_coding(sample_dir: Path, sample_data: dict, write_back=True):
                 pass
 
     if not val:
+        # check folder names
         parts = [p.lower() for p in sample_dir.parts]
-        for p in parts[::-1]:
+        for p in reversed(parts):
             if p in CANONICAL_MAP:
                 val = p
                 break
-        if val is None and sample_dir.parent.name.lower() in CANONICAL_MAP:
-            val = sample_dir.parent.name.lower()
-
     if val:
         mapped = CANONICAL_MAP.get(val)
         if mapped:
@@ -86,9 +81,8 @@ def infer_and_fix_coding(sample_dir: Path, sample_data: dict, write_back=True):
     return None
 
 
-def best_align_ber(decoded_bits: np.ndarray,
-                   gt_bits: np.ndarray,
-                   max_shift: int = 16):
+def best_align_ber(decoded_bits: np.ndarray, gt_bits: np.ndarray, max_shift: int = 16):
+    """Find shift and optional inversion minimizing BER (small shifts only)."""
     if decoded_bits is None or gt_bits is None:
         return (None, 0, False)
     if decoded_bits.size == 0 or gt_bits.size == 0:
@@ -129,6 +123,7 @@ def best_align_ber(decoded_bits: np.ndarray,
 
 
 def apply_alignment(bits: np.ndarray, shift: int, inverted: bool):
+    """Apply shift + optional inversion while keeping same length (for debugging/saving)."""
     if bits is None:
         return None
     if shift == 0:
@@ -182,7 +177,44 @@ def load_dataset(sample_dir: Path):
 
 
 # -------------------------
-# Main pipeline
+# Phase-4 Doppler helpers
+# -------------------------
+def estimate_freq_offset_fft(signal, fs=1.0, search_band=None):
+    """
+    Coarse frequency offset estimator by FFT on the complex baseband samples.
+    Returns frequency offset in cycles / sample (i.e. normalized frequency).
+    - search_band: tuple (min_norm, max_norm) to restrict search in normalized cycles/sample.
+    """
+    x = np.asarray(signal).ravel()
+    N = min(32768, max(2048, len(x)))
+    # pick center slice for stability
+    start = max(0, (len(x) - N) // 2)
+    x_slice = x[start:start + N]
+    # compute FFT of the signal's autocorrelation-like product to emphasize tone
+    S = np.fft.fftshift(np.fft.fft(x_slice * np.conj(x_slice)))
+    freqs = np.fft.fftshift(np.fft.fftfreq(len(x_slice), d=1.0 / fs))
+    if search_band is not None:
+        mask = (freqs >= search_band[0]) & (freqs <= search_band[1])
+        if not np.any(mask):
+            idx = np.argmax(np.abs(S))
+        else:
+            idx = np.argmax(np.abs(S[mask]))
+            idx = np.where(mask)[0][0] + idx
+    else:
+        idx = np.argmax(np.abs(S))
+    freq_hat = freqs[idx]  # cycles/sample normalized
+    return float(freq_hat)
+
+
+def apply_freq_correction(rx_samples, freq_offset_cycles_per_sample):
+    """Multiply rx_samples by exp(-j*2π*freq_offset*n) to remove the estimated offset."""
+    n = np.arange(len(rx_samples))
+    correction = np.exp(-1j * 2.0 * np.pi * freq_offset_cycles_per_sample * n)
+    return rx_samples * correction
+
+
+# -------------------------
+# Main phase processing
 # -------------------------
 def process_phase(phase_num,
                   config,
@@ -194,6 +226,12 @@ def process_phase(phase_num,
                   max_shift=16,
                   save_aligned=False,
                   margin=32):
+    """
+    Process a specific challenge phase (1..4). This function does:
+      - Phase 1 style demodulation + alignment/BER reporting
+      - Phase 3 integration via run_phase3_on_sample when relevant
+      - Phase 4: estimate doppler -> correct -> re-run phase processing on corrected samples
+    """
     logger = logging.getLogger(__name__)
     phase_config = config.get_phase_config(phase_num)
     dataset_path = Path(phase_config['dataset_path'])
@@ -201,24 +239,25 @@ def process_phase(phase_num,
         logger.error("Dataset not found: %s", dataset_path)
         return
 
+    # Construct demodulator used across phases (tuning from config)
     timing_loop_bw = phase_config.get('timing_bw', 0.002)
     phase_loop_bw = phase_config.get('phase_bw', 0.02)
-
     demodulator = BPSKDemodulator(
         samples_per_symbol=phase_config['samples_per_symbol'],
         timing_bw=timing_loop_bw,
         phase_bw=phase_loop_bw
     )
 
+    # Find sample dirs
     sample_dirs = sorted({p.parent for p in dataset_path.glob('**/rx.npy')})
     if not sample_dirs:
-        logger.warning("No valid sample data (rx.npy) found in %s", dataset_path)
+        logger.warning("No valid sample data found in %s", dataset_path)
         return
 
     phase_results = []
 
-    # Diagnostic run on first sample
-    diag_dir = sorted(sample_dirs)[0]
+    # Diagnostic run for first sample (gives quick visibility)
+    diag_dir = sample_dirs[0]
     logger.info("=== Diagnostic run on %s ===", diag_dir.relative_to(dataset_path))
     try:
         sample_data = load_dataset(diag_dir)
@@ -230,48 +269,75 @@ def process_phase(phase_num,
                 track_phase_bw=track_bw,
                 verbose=True
             )
+            logger.info("len(bits)=%d, diagnostic symbols=%d", len(bits_diag), 0 if corrected_diag is None else len(corrected_diag))
+            # attempt aligned BER if GT present
             gt = np.array(sample_data.get("ground_truth_bits", [])).ravel().astype(np.uint8)
-            logger.info("len(bits)=%d, len(gt)=%d", len(bits_diag), len(gt))
             if gt.size > preamble_len and len(bits_diag) > 0:
                 gt_data = gt[preamble_len: preamble_len + min(len(bits_diag) + margin, gt.size)]
                 best_ber, best_shift, inverted = best_align_ber(bits_diag, gt_data, max_shift=max_shift)
                 if best_ber is not None:
-                    logger.info("ALIGN: shift=%+d, inverted=%s, BER=%.4e", best_shift, inverted, best_ber)
+                    logger.info("ALIGN (diag): shift=%+d, inverted=%s, BER=%.4e", best_shift, inverted, best_ber)
+            # try show constellation
+            if show_constellation_for_first and corrected_diag is not None:
+                try:
+                    plot_constellation(corrected_diag, f"Constellation - {diag_dir.name}")
+                except Exception:
+                    logger.debug("Constellation plot skipped (diagnostic).")
     except Exception as e:
-        logger.debug("Diagnostic run skipped/failed: %s", e)
+        logger.debug("Diagnostic run failed: %s", e)
 
-    # Full phase processing
+    # Iterate all samples
     for i, sample_dir in enumerate(sorted(sample_dirs)):
         logger.info("Processing %s...", sample_dir.relative_to(dataset_path))
         try:
             sample_data = load_dataset(sample_dir)
-
-            # Try to infer and fix coding early so Phase-3 integration can read it
-            coding = infer_and_fix_coding(sample_dir, sample_data, write_back=True)
-            if coding is None:
-                logger.debug("  Could not infer coding for %s yet (will still attempt run_phase3 if integration infers)", sample_dir.name)
+            # infer coding label early (helps phase3)
+            infer_and_fix_coding(sample_dir, sample_data, write_back=True)
 
             if 'rx_samples' not in sample_data:
-                logger.warning("  Skipping %s: 'rx.npy' file not loaded properly.", sample_dir.name)
+                logger.warning("  Skipping %s: missing rx.npy", sample_dir.name)
                 continue
 
+            rx_samples = sample_data['rx_samples'].astype(np.complex128)
+
+            # If phase 4 requested or dataset indicates doppler, run coarse frequency estimation & correction
+            freq_offset_est = None
+            if phase_num == 4 or ('doppler_hz' in sample_data or 'doppler' in str(sample_dir)):
+                # normalized cycles/sample search range default -0.125..0.125
+                search_band = None
+                try:
+                    # If metadata gives approximate doppler (Hz) + sample rate, use it
+                    if sample_data.get('doppler_hz') is not None and sample_data.get('sample_rate') is not None:
+                        dop_hz = float(sample_data['doppler_hz'])
+                        fs = float(sample_data['sample_rate'])
+                        search_band = (dop_hz / fs - 0.01, dop_hz / fs + 0.01)
+                    freq_offset_est = estimate_freq_offset_fft(rx_samples, fs=1.0, search_band=search_band)
+                    logger.info("  Estimated normalized freq offset = %g cycles/sample", freq_offset_est)
+                    # apply correction
+                    rx_corrected = apply_freq_correction(rx_samples, freq_offset_est)
+                    # update sample data so demodulator sees corrected samples
+                    sample_data['rx_samples'] = rx_corrected
+                except Exception as e:
+                    logger.debug("  Frequency estimation/correction failed: %s", e)
+                    sample_data['rx_samples'] = rx_samples
+
+            # Run demodulator (phase 1 style)
             bits, corrected_symbols = demodulator.process(
                 sample_data,
                 preamble_len=preamble_len,
                 acquire_phase_bw=acquire_bw,
                 track_phase_bw=track_bw,
-                verbose=verbose_first and i == 0
+                verbose=verbose_first and (i == 0)
             )
 
-            # ---------------------------
-            # Save corrected symbols for offline inspection (D)
-            # ---------------------------
+            # Save corrected symbols for debugging
             try:
-                np.save(sample_dir / 'corrected_syms.npy', np.asarray(corrected_symbols))
+                if corrected_symbols is not None:
+                    np.save(sample_dir / 'corrected_syms.npy', np.asarray(corrected_symbols))
             except Exception:
                 logger.debug("  Could not save corrected_syms (non-fatal)")
 
-            # Aligned BER (phase-1)
+            # Phase-1 aligned BER reporting
             ber = None
             best_shift = 0
             inverted = False
@@ -285,120 +351,74 @@ def process_phase(phase_num,
                         logger.info("  ALIGN: shift=%+d, inverted=%s, BER=%.2e", best_shift, inverted, best_ber)
                         ber = best_ber
                 else:
-                    logger.info("  (GT present but too short after eval preamble)")
+                    logger.info("  (GT present but too short after preamble)")
             else:
                 logger.info("  (GT unavailable; skipping BER for this sample)")
 
-            # record phase_results entry (include coding if present)
-            coding_name = str(sample_data.get('coding', sample_data.get('coding_name', 'unknown'))).lower()
-            phase_results.append({
-                'sample': sample_dir.name,
-                'ber': ber,
-                'snr': sample_data.get('snr', sample_data.get('snr_db')),
-                'coding': coding_name
-            })
-
-            # Save Phase-1 decoded bits and bits.npy
-            save_decoded_bits(sample_dir, bits)
+            # Save phase-1 decoded bits
             try:
-                np.save(sample_dir / 'bits.npy', bits.astype(np.uint8))
+                np.save(sample_dir / 'decoded_bits.npy', bits.astype(np.uint8))
             except Exception:
-                logger.debug("  Could not save bits.npy (non-fatal)")
+                logger.debug("  Could not save decoded_bits.npy")
 
-            # ---------------------------
-            # Robust LLR computation (normalize base LLRs)
-            # ---------------------------
-            LLR_CLIP = 20.0
-            SCALE_CANDIDATES = [0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0]
-            SIGN_CANDIDATES = [+1.0, -1.0]
-            # phase candidates every 5 degrees
-            PHASE_CANDIDATES = np.deg2rad(np.arange(0, 360, 5.0))
-            DEFAULT_SIGN = +1.0
-            DEFAULT_SCALE = 1.0
-
-            # infer noise_var
-            noise_var = 1.0
-            if sample_data.get('snr_db') is not None:
-                try:
-                    EbN0 = 10 ** (float(sample_data['snr_db']) / 10.0)
-                    noise_var = 1.0 / (2.0 * EbN0)
-                except Exception:
-                    noise_var = 1.0
-            elif sample_data.get('snr') is not None:
-                try:
-                    EbN0 = float(sample_data['snr'])
-                    noise_var = 1.0 / (2.0 * EbN0)
-                except Exception:
-                    noise_var = 1.0
-
+            # Compute base LLRs (normalized)
             demod_llrs_base = None
-            y_norm = None
             try:
                 y = np.asarray(corrected_symbols).ravel()
-                if y.size == 0:
-                    raise ValueError("corrected_symbols empty")
-                mean_power = float(np.mean(np.abs(y) ** 2))
+                mean_power = float(np.mean(np.abs(y) ** 2)) if y.size > 0 else 1.0
                 if mean_power <= 0:
                     mean_power = 1.0
-                y_norm = y / np.sqrt(mean_power)  # normalized complex symbols
-                # base LLR computed from real(y_norm) assuming 0 phase
+                # infer noise var from metadata if present
+                noise_var = 1.0
+                if sample_data.get('snr_db') is not None:
+                    try:
+                        EbN0 = 10 ** (float(sample_data['snr_db']) / 10.0)
+                        noise_var = 1.0 / (2.0 * EbN0)
+                    except Exception:
+                        noise_var = 1.0
+                y_norm = y / np.sqrt(mean_power)
                 demod_llrs_base = (2.0 * np.real(y_norm)) / (1e-12 + 2.0 * noise_var)
-                demod_llrs_base = np.clip(demod_llrs_base, -LLR_CLIP, LLR_CLIP)
+                demod_llrs_base = np.clip(demod_llrs_base, -50.0, 50.0)
                 try:
                     np.save(sample_dir / 'llrs_base.npy', demod_llrs_base)
                 except Exception:
                     pass
             except Exception as e:
                 demod_llrs_base = None
-                y_norm = None
                 logger.debug("  Could not compute demod_llrs_base: %s", e)
 
-            # ---------------------------
-            # Auto sign+scale+phase detection (if GT available) -> pick chosen_llrs
-            # ---------------------------
+            # Auto sign/scale sweep when GT is available (to choose best soft LLR)
             chosen_llrs = None
-            chosen_sign = DEFAULT_SIGN
-            chosen_scale = DEFAULT_SCALE
-            chosen_phase = 0.0
-            if y_norm is not None:
+            if demod_llrs_base is not None:
+                SIGN_CANDIDATES = [+1.0, -1.0]
+                SCALE_CANDIDATES = [0.05, 0.1, 0.25, 0.5, 1.0, 1.6, 2.0]
+                LLR_CLIP = 50.0
+                chosen_sign, chosen_scale = +1.0, 1.0
                 gt_for_eval = None
                 if 'ground_truth_bits' in sample_data:
                     gt_all = np.array(sample_data['ground_truth_bits']).ravel().astype(np.uint8)
                     if gt_all.size > preamble_len:
-                        gt_for_eval = gt_all[preamble_len: preamble_len + y_norm.size]
-
-                def _decode_with_llrs(llrs_arr):
-                    try:
-                        res = run_phase3_on_sample(
-                            str(sample_dir),
-                            prefer_soft=True,
-                            noise_var=noise_var,
-                            demod_bits=bits.astype(np.uint8),
-                            demod_llrs=llrs_arr
-                        )
-                        if isinstance(res, tuple):
-                            decoded_bits, _fer = res
-                        else:
-                            decoded_bits = res
-                        if decoded_bits is None:
-                            return None
-                        return np.asarray(decoded_bits).ravel().astype(np.uint8)
-                    except Exception as e:
-                        logger.debug("    decode error during sweep: %s", e)
-                        return None
-
+                        gt_for_eval = gt_all[preamble_len: preamble_len + demod_llrs_base.size]
                 if gt_for_eval is not None and gt_for_eval.size > 0:
-                    best_combo = (None, None, None, None, 1e9)  # sign, scale, phase, decoded, ber
+                    best_combo = (None, None, 1e9)
                     for sign in SIGN_CANDIDATES:
                         for scale in SCALE_CANDIDATES:
-                            for phase in PHASE_CANDIDATES:
-                                # rotate complex symbols by -phase then take real part
-                                y_rot = y_norm * np.exp(-1j * float(phase))
-                                llrs_try = (2.0 * np.real(y_rot)) / (1e-12 + 2.0 * noise_var)
-                                llrs_try = np.clip(sign * llrs_try * float(scale), -LLR_CLIP, LLR_CLIP)
-                                decoded_try = _decode_with_llrs(llrs_try)
-                                if decoded_try is None or decoded_try.size == 0:
+                            llr_try = np.clip(sign * demod_llrs_base * float(scale), -LLR_CLIP, LLR_CLIP)
+                            try:
+                                res = run_phase3_on_sample(
+                                    str(sample_dir),
+                                    prefer_soft=True,
+                                    noise_var=noise_var,
+                                    demod_bits=bits.astype(np.uint8),
+                                    demod_llrs=llr_try
+                                )
+                                if isinstance(res, tuple):
+                                    decoded_try, _fer = res
+                                else:
+                                    decoded_try = res
+                                if decoded_try is None:
                                     continue
+                                decoded_try = np.asarray(decoded_try).ravel().astype(np.uint8)
                                 L = min(decoded_try.size, gt_for_eval.size)
                                 if L <= 0:
                                     continue
@@ -406,72 +426,53 @@ def process_phase(phase_num,
                                     ber_try = float(calculate_ber(decoded_try[:L], gt_for_eval[:L]))
                                 except Exception:
                                     ber_try = float(np.mean(decoded_try[:L] != gt_for_eval[:L]))
-                                # keep best
-                                if ber_try < best_combo[4]:
-                                    best_combo = (sign, scale, float(phase), decoded_try, ber_try)
-                                # small optimization: early stop if near zero BER
-                                if ber_try <= 1e-6:
-                                    break
-                            else:
-                                continue
-                            break
+                                if ber_try < best_combo[2]:
+                                    best_combo = (sign, scale, ber_try)
+                            except Exception as e:
+                                logger.debug("    sweep decode error: %s", e)
                     if best_combo[0] is not None:
-                        chosen_sign, chosen_scale, chosen_phase, chosen_decoded, chosen_ber = best_combo[0], best_combo[1], best_combo[2], best_combo[3], best_combo[4]
-                        # compute chosen llrs based on chosen_phase/sign/scale
-                        y_rot = y_norm * np.exp(-1j * float(chosen_phase))
-                        chosen_llrs = np.clip(chosen_sign * (2.0 * np.real(y_rot)) / (1e-12 + 2.0 * noise_var) * float(chosen_scale), -LLR_CLIP, LLR_CLIP)
-                        logger.info("  Auto-chosen sign=%+.0f scale=%g phase=%.2f (BER=%.2e)", chosen_sign, chosen_scale, chosen_phase, chosen_ber)
+                        chosen_sign, chosen_scale = best_combo[0], best_combo[1]
+                        logger.info("  Auto-chosen sign=%+.0f scale=%g (BER=%.2e)", chosen_sign, chosen_scale, best_combo[2])
                     else:
-                        # fallback: default sign/scale, phase=0
-                        chosen_sign = DEFAULT_SIGN
-                        chosen_scale = DEFAULT_SCALE
-                        chosen_phase = 0.0
-                        y_rot = y_norm * np.exp(-1j * float(chosen_phase))
-                        chosen_llrs = np.clip(chosen_sign * (2.0 * np.real(y_rot)) / (1e-12 + 2.0 * noise_var) * float(chosen_scale), -LLR_CLIP, LLR_CLIP)
-                        logger.info("  Auto-sweep found no valid decode; using default sign=%+.0f scale=%g phase=%.2f", chosen_sign, chosen_scale, chosen_phase)
-                else:
-                    # No GT -> pick safe defaults; rotate by 0
-                    chosen_sign = DEFAULT_SIGN
-                    chosen_scale = DEFAULT_SCALE
-                    chosen_phase = 0.0
-                    y_rot = y_norm * np.exp(-1j * float(chosen_phase))
-                    chosen_llrs = np.clip(chosen_sign * (2.0 * np.real(y_rot)) / (1e-12 + 2.0 * noise_var) * float(chosen_scale), -LLR_CLIP, LLR_CLIP)
-                    logger.debug("  No GT available; using default sign=%+.0f scale=%g phase=%.2f", chosen_sign, chosen_scale, chosen_phase)
-
+                        logger.info("  Auto-sweep found no improvement; using defaults")
+                chosen_llrs = np.clip(chosen_sign * demod_llrs_base * float(chosen_scale), -LLR_CLIP, LLR_CLIP)
                 try:
                     np.save(sample_dir / 'llrs.npy', chosen_llrs)
                 except Exception:
-                    logger.debug("  Could not save chosen llrs.npy (non-fatal)")
-            else:
-                logger.debug("  No demod_llrs_base available; Phase-3 will be called with demod_bits only if supported")
+                    logger.debug("  Could not save llrs.npy (non-fatal)")
 
-            # ---------------------------
-            # Final Phase-3 decode (only if we can identify coding)
-            # ---------------------------
+            # Phase-3 final decode (if coding known)
             coding_canonical = sample_data.get('coding')
             if coding_canonical is None:
                 coding_canonical = infer_and_fix_coding(sample_dir, sample_data, write_back=False)
 
-            if coding_canonical not in ('conv', 'rs'):
-                logger.error("  Skipping Phase-3 for %s: unknown coding '%s'. Put 'conv' or 'rs' in meta.json.", sample_dir.name, str(coding_canonical))
-            else:
-                try:
-                    logger.info("  Running Phase 3 decoding (final)...")
-                    phase3_result = run_phase3_on_sample(
-                        str(sample_dir),
-                        prefer_soft=True,
-                        noise_var=noise_var,
-                        demod_bits=bits.astype(np.uint8),
-                        demod_llrs=chosen_llrs
-                    )
-                    if isinstance(phase3_result, tuple):
-                        decoded_phase3_bits, fer = phase3_result
-                        logger.info("  Phase 3 (RS) decoded %d bits, FER=%s", 0 if decoded_phase3_bits is None else len(decoded_phase3_bits), str(fer))
-                    else:
-                        decoded_phase3_bits = phase3_result
-                        logger.info("  Phase 3 (Conv) decoded %d bits", 0 if decoded_phase3_bits is None else len(decoded_phase3_bits))
-                except Exception as e:
-                    logger.exception("  Phase 3 decoding failed for %s: %s", sample_dir.name, e)
+            if phase_num == 3 or coding_canonical in ('conv', 'rs'):
+                if coding_canonical not in ('conv', 'rs'):
+                    logger.info("  Phase-3: coding not identified as conv/rs; skipping Phase-3.")
+                else:
+                    try:
+                        logger.info("  Running Phase 3 decoding (final)...")
+                        phase3_result = run_phase3_on_sample(
+                            str(sample_dir),
+                            prefer_soft=True,
+                            noise_var=noise_var,
+                            demod_bits=bits.astype(np.uint8),
+                            demod_llrs=chosen_llrs
+                        )
+                        if isinstance(phase3_result, tuple):
+                            decoded_phase3_bits, fer = phase3_result
+                            logger.info("  Phase 3 (RS) decoded %d bits, FER=%s", 0 if decoded_phase3_bits is None else len(decoded_phase3_bits), str(fer))
+                        else:
+                            decoded_phase3_bits = phase3_result
+                            logger.info("  Phase 3 (Conv) decoded %d bits", 0 if decoded_phase3_bits is None else len(decoded_phase3_bits))
+                        # save final phase3 output if produced
+                        if decoded_phase3_bits is not None:
+                            try:
+                                np.save(sample_dir / 'decoded_phase3_bits.npy', np.asarray(decoded_phase3_bits).astype(np.uint8))
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        logger.exception("  Phase 3 decoding failed for %s: %s", sample_dir.name, e)
 
             # optionally save aligned bits
             if save_aligned and (best_shift != 0 or inverted):
@@ -481,22 +482,31 @@ def process_phase(phase_num,
                 except Exception:
                     logger.debug("  Could not save decoded_bits_aligned.npy (non-fatal)")
 
-            # optional plot
-            if i == 0 and show_constellation_for_first:
+            # record results for phase report
+            phase_results.append({
+                'sample': sample_dir.name,
+                'ber': ber,
+                'snr': sample_data.get('snr', sample_data.get('snr_db')),
+                'coding': sample_data.get('coding', 'unknown')
+            })
+
+            # optional constellation plot for first sample
+            if i == 0 and show_constellation_for_first and corrected_symbols is not None:
                 try:
-                    plot_constellation(corrected_symbols, f"Constellation for {sample_dir.name}")
+                    plot_constellation(corrected_symbols, f"Constellation - {sample_dir.name}")
                 except Exception:
-                    logger.debug("  constellation plotting failed (non-fatal)")
+                    logger.debug("  Could not plot constellation (non-fatal)")
 
         except Exception as e:
             logger.exception("  Error processing %s: %s", sample_dir.name, e)
 
+    # generate final phase report
     if phase_results:
         generate_phase_report(phase_num, phase_results, phase_config)
 
 
 # -------------------------
-# Helpers: saving & reporting
+# Reporting + saving
 # -------------------------
 def save_decoded_bits(sample_dir: Path, decoded_bits: np.ndarray):
     try:
@@ -508,7 +518,6 @@ def save_decoded_bits(sample_dir: Path, decoded_bits: np.ndarray):
 def generate_phase_report(phase_num, results, config_dict):
     logger = logging.getLogger(__name__)
     logger.info("\n--- Phase %d Summary ---", phase_num)
-
     bers = [r['ber'] for r in results if r.get('ber') is not None]
     if not bers:
         logger.info("No BERs computed for this phase.")
@@ -517,7 +526,6 @@ def generate_phase_report(phase_num, results, config_dict):
     logger.info("Average BER: %.2e", avg_ber)
 
     perf_cfg = config_dict.get('performance_threshold', 1e-2)
-
     if isinstance(perf_cfg, dict):
         try:
             thresholds_str = ", ".join([f"{k}={v:.2e}" for k, v in perf_cfg.items()])
@@ -565,7 +573,6 @@ def generate_phase_report(phase_num, results, config_dict):
         except Exception:
             logger.info("Threshold: %s", str(perf_cfg))
             thr = 1e-2
-        logger.info("Decision threshold used: %.2e", thr)
         if avg_ber <= thr:
             logger.info("✓ PHASE PASSED")
         else:
@@ -584,7 +591,7 @@ def parse_args():
     p.add_argument("--margin", type=int, default=32, help="Extra margin when building GT window")
     p.add_argument("--acquire-bw", type=float, default=0.06, help="Acquire phase loop bandwidth")
     p.add_argument("--track-bw", type=float, default=0.003, help="Track phase loop bandwidth")
-    p.add_argument("--phase", type=int, choices=[1, 2, 3, 4], default=None, help="Process a single phase (1-4). Default: all phases")
+    p.add_argument("--phase", type=int, choices=[1, 2, 3, 4], default=None, help="Process a single phase (1-4). Default: all")
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level")
     return p.parse_args()
 
@@ -618,4 +625,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

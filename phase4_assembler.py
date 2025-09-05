@@ -2,307 +2,411 @@
 """
 phase4_assembler.py
 
-Phase-4 assembly & CRC-sweep helper.
+Scan decoded bitstreams in sample directories, try packing bits->bytes with MSB/LSB,
+slide a window over bytes, check CRCs (crc32, crc16-ccitt, crc16-ibm, crc8),
+and save extracted payloads that pass CRC.
+
+Also: optional small bit-shift & inversion searches, and a helper to
+create decoded_bits_aligned.npy from ground truth.
 
 Usage:
-    python phase4_assembler.py --root cubesat_dataset/phase3_coding --min-bytes 8 --max-bytes 256
-
-Defaults:
-  - Root: cubesat_dataset/phase3_coding
-  - CRCs tried: crc32, crc16-ccitt (init 0xFFFF), crc8 (poly 0x07)
-  - Byte-aligns windows (step = 1 byte), window sizes default 8..256 bytes
-  - Tries shifts in [-2..2] and inversion if --try-align supplied
-Outputs:
-  - extracted/ files in each sample dir for matches
-  - phase4_report.json at root with summary
+    python phase4_assembler.py --root cubesat_dataset/phase3_coding --min-bytes 8 --max-bytes 128 --try-align --try-invert --debug
 """
+from __future__ import annotations
 import argparse
+import json
 import logging
 from pathlib import Path
-import json
+import sys
 import numpy as np
+import os
+import zlib
 import binascii
-from collections import defaultdict
+from typing import Optional, Sequence, Tuple, Dict, Any
 
-# -----------------------
+logger = logging.getLogger("phase4")
+
+# -------------------------
 # CRC helpers
-# -----------------------
-def crc32_bytes(data: bytes) -> int:
-    return binascii.crc32(data) & 0xFFFFFFFF
+# -------------------------
+def crc32_be(data: bytes) -> int:
+    # zlib.crc32 returns unsigned 32-bit
+    return zlib.crc32(data) & 0xFFFFFFFF
 
-def crc16_ccitt(data: bytes, init=0xFFFF) -> int:
-    crc = init & 0xFFFF
+def crc16_ccitt(data: bytes, init: int = 0xFFFF) -> int:
+    # binascii.crc_hqx implements CRC-CCITT with initial value
+    return binascii.crc_hqx(data, init) & 0xFFFF
+
+def crc16_ibm(data: bytes, poly: int = 0x8005, init: int = 0x0000) -> int:
+    # Direct bitwise implementation of CRC16-IBM/ARC (poly 0x8005) reflected
+    reg = init
     for b in data:
-        crc ^= (b << 8)
+        reg ^= b
         for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            if reg & 1:
+                reg = (reg >> 1) ^ poly
             else:
-                crc = (crc << 1) & 0xFFFF
-    return crc & 0xFFFF
+                reg >>= 1
+    return reg & 0xFFFF
 
-def crc8(data: bytes, poly=0x07, init=0x00) -> int:
-    crc = init & 0xFF
+def crc8_poly7(data: bytes, init: int = 0x00, poly: int = 0x07) -> int:
+    reg = init
     for b in data:
-        crc ^= b
+        reg ^= b
         for _ in range(8):
-            if crc & 0x80:
-                crc = ((crc << 1) ^ (poly << 0)) & 0xFF
+            if reg & 0x80:
+                reg = ((reg << 1) ^ poly) & 0xFF
             else:
-                crc = (crc << 1) & 0xFF
-    return crc & 0xFF
+                reg = (reg << 1) & 0xFF
+    return reg & 0xFF
 
-# -----------------------
-# Bit -> Bytes packing
-# -----------------------
-def bits_to_bytes(bits: np.ndarray, pad_to_byte=True):
+CRC_TABLE = {
+    'crc32': {'len': 4, 'fn': crc32_be},
+    'crc16': {'len': 2, 'fn': crc16_ccitt},     # default to CCITT
+    'crc16_ibm': {'len': 2, 'fn': crc16_ibm},
+    'crc8':  {'len': 1, 'fn': crc8_poly7},
+}
+
+# -------------------------
+# Packing helpers
+# -------------------------
+def bits_to_bytes(bits: np.ndarray, bitorder: str = 'msb') -> bytes:
     """
-    bits: 1D numpy array of 0/1
-    pack MSB-first (bitorder='big') so bits[0] -> highest bit of first byte
-    If length not multiple of 8 and pad_to_byte=True, pad with zeros at end (LSBs).
+    Pack array of 0/1 bits into bytes.
+    bitorder: 'msb' => first bit is MSB of first byte (bit 7)
+              'lsb' => first bit is LSB of first byte (bit 0)
+    Pads with zeros to next byte boundary.
     """
-    if bits is None or bits.size == 0:
+    bits = np.asarray(bits).astype(np.uint8).ravel()
+    if bits.size == 0:
         return b''
-    bits = np.asarray(bits).ravel().astype(np.uint8)
-    rem = bits.size % 8
-    if rem != 0:
-        if pad_to_byte:
-            pad_len = 8 - rem
-            bits = np.concatenate([bits, np.zeros(pad_len, dtype=np.uint8)])
-        else:
-            bits = bits[: bits.size - rem]
-    # np.packbits with bitorder='big' available in numpy >= 1.17; safe for most installs
-    try:
-        packed = np.packbits(bits, bitorder='big')
-    except TypeError:
-        # older numpy fallback (default is 'big' historically)
-        packed = np.packbits(bits)
-    return packed.tobytes()
 
-# -----------------------
-# Frame detection
-# -----------------------
-def scan_for_frames_by_crc(byte_stream: bytes, min_payload_b: int, max_payload_b: int,
-                           crc_candidates=('crc32', 'crc16', 'crc8'),
-                           max_windows=50000):
+    pad = (-bits.size) % 8
+    if pad:
+        bits = np.concatenate([bits, np.zeros(pad, dtype=np.uint8)])
+    bits = bits.reshape(-1, 8)
+
+    if bitorder == 'msb':
+        byte_vals = (bits * (1 << np.arange(7, -1, -1))).sum(axis=1).astype(np.uint8)
+    else:  # lsb
+        byte_vals = (bits * (1 << np.arange(0, 8))).sum(axis=1).astype(np.uint8)
+    return bytes(byte_vals.tolist())
+
+# -------------------------
+# Alignment helper (makes decoded_bits_aligned.npy using GT)
+# -------------------------
+def best_align_simple(decoded_bits: np.ndarray, gt_bits: np.ndarray, max_shift:int=16) -> Tuple[Optional[int], Optional[bool], Optional[float]]:
     """
-    Slide a byte-window through byte_stream and test CRCs.
-    Expects last N bytes of window are CRC field (4/2/1 depending).
-    Returns list of matches: dicts with start_byte, total_len, payload_bytes, crc_name.
+    Find best shift (-max_shift..+max_shift) and inversion flag minimizing BER.
+    Returns (best_shift, inverted, best_ber) or (None,None,None) if no overlap.
     """
-    matches = []
-    n = len(byte_stream)
-    checked = 0
-    # For efficiency limit windows tested
-    for total_len in range(min_payload_b + 1, max_payload_b + 1):  # +1 to leave at least 1 byte for CRC
-        # For each CRC type, compute crc_len
-        for crc_name in crc_candidates:
-            crc_len = 4 if crc_name == 'crc32' else (2 if crc_name == 'crc16' else 1)
-            payload_len = total_len - crc_len
-            if payload_len <= 0:
+    if decoded_bits is None or gt_bits is None:
+        return (None, None, None)
+    if decoded_bits.size == 0 or gt_bits.size == 0:
+        return (None, None, None)
+    best = (None, None, 1.0)
+    for shift in range(-max_shift, max_shift+1):
+        if shift >= 0:
+            L = min(decoded_bits.size - shift, gt_bits.size)
+            if L <= 0: continue
+            d = decoded_bits[shift:shift+L]
+            g = gt_bits[:L]
+        else:
+            L = min(decoded_bits.size, gt_bits.size + shift)
+            if L <= 0: continue
+            d = decoded_bits[:L]
+            g = gt_bits[-shift:-shift+L]
+        ber = float(np.mean(d != g))
+        ber_inv = float(np.mean((1 - d) != g))
+        if ber < best[2]:
+            best = (shift, False, ber)
+        if ber_inv < best[2]:
+            best = (shift, True, ber_inv)
+    return best
+
+def apply_alignment(bits: np.ndarray, shift: int, inverted: bool) -> np.ndarray:
+    if bits is None:
+        return None
+    bits = np.asarray(bits).astype(np.uint8).ravel()
+    if shift == 0:
+        out = bits.copy()
+    elif shift > 0:
+        if shift >= bits.size:
+            out = np.zeros_like(bits)
+        else:
+            out = bits[shift:]
+            pad_len = bits.size - out.size
+            if pad_len > 0:
+                out = np.concatenate([out, np.zeros(pad_len, dtype=bits.dtype)])
+    else:
+        pad_left = -shift
+        if pad_left >= bits.size:
+            out = np.zeros_like(bits)
+        else:
+            out = np.concatenate([np.zeros(pad_left, dtype=bits.dtype), bits])[:bits.size]
+    if inverted:
+        out = 1 - out
+    return out.astype(np.uint8)
+
+# -------------------------
+# Core assembler
+# -------------------------
+def inspect_and_extract_sample(
+    sample_dir: Path,
+    min_bytes: int,
+    max_bytes: int,
+    crc_list: Sequence[str],
+    try_shifts: bool,
+    max_shift: int,
+    try_invert: bool,
+    bitorder_modes: Sequence[str],
+    whitelist_len: Optional[int] = None,
+    debug: bool = False
+) -> Dict[str, Any]:
+    """
+    For one sample: load decoded bits (try aligned first),
+    try packing to bytes under bitorder_modes, optionally test shifts and inversion,
+    slide windows of bytes and test CRCs.
+    Returns dict summary and saves extracted payloads under extracted/<sample_dir.name>/
+    """
+    summary = {'sample': str(sample_dir), 'matches': []}
+    # Candidate input bit files
+    cand_files = [
+        sample_dir / 'decoded_bits_aligned.npy',
+        sample_dir / 'decoded_bits.npy',
+        sample_dir / 'bits.npy'
+    ]
+    bits = None
+    for f in cand_files:
+        if f.exists():
+            try:
+                bits = np.load(f)
+                if isinstance(bits, np.ndarray):
+                    bits = bits.ravel().astype(np.uint8)
+                    break
+            except Exception:
                 continue
-            # Slide start position (byte aligned)
-            for start in range(0, n - total_len + 1):
-                checked += 1
-                if checked > max_windows:
-                    return matches, checked
-                window = byte_stream[start:start + total_len]
-                payload = window[:payload_len]
-                crc_field = window[payload_len:]
-                crc_val = int.from_bytes(crc_field, byteorder='big', signed=False)
-                # compute candidate CRC
-                if crc_name == 'crc32':
-                    calc = crc32_bytes(payload)
-                    if calc == crc_val:
-                        matches.append({'start_byte': start, 'total_len': total_len, 'crc': 'crc32',
-                                        'payload': payload})
-                elif crc_name == 'crc16':
-                    calc = crc16_ccitt(payload, init=0xFFFF)
-                    if calc == crc_val:
-                        matches.append({'start_byte': start, 'total_len': total_len, 'crc': 'crc16-ccitt',
-                                        'payload': payload})
-                elif crc_name == 'crc8':
-                    calc = crc8(payload, poly=0x07, init=0x00)
-                    if calc == crc_val:
-                        matches.append({'start_byte': start, 'total_len': total_len, 'crc': 'crc8',
-                                        'payload': payload})
-    return matches, checked
+    if bits is None:
+        summary['error'] = "no_bits"
+        if debug:
+            logger.debug("[%s] no decoded bit file found.", sample_dir)
+        return summary
 
-# -----------------------
-# Main per-sample logic
-# -----------------------
-def process_sample(sample_dir: Path, args, logger):
-    """
-    Return dict summary for this sample.
-    """
-    sample_dir = Path(sample_dir)
-    # prefer aligned file if present
-    candidates = ['decoded_bits_aligned.npy', 'decoded_bits.npy', 'bits.npy']
-    bits_path = None
-    for fn in candidates:
-        p = sample_dir / fn
-        if p.exists():
-            bits_path = p
-            break
-    if bits_path is None:
-        logger.warning("  No decoded bits found in %s (tried %s)", sample_dir, candidates)
-        return {'sample': str(sample_dir), 'found_bits': False}
+    # directory for extracted payloads
+    extracted_dir = sample_dir / 'extracted'
+    extracted_dir.mkdir(exist_ok=True)
 
-    try:
-        bits = np.load(bits_path).ravel().astype(np.uint8)
-    except Exception as e:
-        logger.exception("  Failed to load bits from %s: %s", bits_path, e)
-        return {'sample': str(sample_dir), 'found_bits': False}
+    found_any = False
+    # Pre-generate candidate shifts & inversion options
+    shift_range = [0]
+    if try_shifts:
+        shift_range = list(range(-max_shift, max_shift+1))
+    invert_opts = [False, True] if try_invert else [False]
 
-    logger.info("  Loaded bits from %s (len=%d)", bits_path.name, bits.size)
-    # optionally try small shifts and inversion
-    shifts = [0]
-    if args.try_align:
-        L = args.try_align_range
-        shifts = list(range(-L, L + 1))
-    inversions = [False, True] if args.try_invert else [False]
+    # Loop over bitorder modes - we will try each and keep matches
+    for bitorder in bitorder_modes:
+        if debug:
+            logger.debug("[%s] trying bitorder=%s", sample_dir.name, bitorder)
+        # optionally, we may try shifts/inversions in bit domain
+        for shift in shift_range:
+            for inverted in invert_opts:
+                bits_try = apply_alignment(bits, shift, inverted)
+                # convert to bytes
+                b = bits_to_bytes(bits_try, bitorder=bitorder)
+                if len(b) == 0:
+                    continue
+                # Now slide over bytes windows
+                L_bytes = len(b)
+                # if whitelist_len provided — only test that exact payload len (payload excludes CRC)
+                if whitelist_len is not None:
+                    payload_lengths = [whitelist_len]
+                else:
+                    payload_lengths = list(range(min_bytes, min(max_bytes, L_bytes) + 1))
 
-    sample_matches = []
-    tried = 0
-    for shift in shifts:
-        # apply shift (left positive -> drop first shift samples; negative -> pad left zeros)
-        if shift == 0:
-            b_shifted = bits
-        elif shift > 0:
-            if shift >= bits.size:
-                b_shifted = np.zeros_like(bits)
-            else:
-                tmp = bits[shift:]
-                pad_len = bits.size - tmp.size
-                if pad_len > 0:
-                    tmp = np.concatenate([tmp, np.zeros(pad_len, dtype=tmp.dtype)])
-                b_shifted = tmp
-        else:
-            pad_left = -shift
-            if pad_left >= bits.size:
-                b_shifted = np.zeros_like(bits)
-            else:
-                tmp = np.concatenate([np.zeros(pad_left, dtype=bits.dtype), bits])[:bits.size]
-                b_shifted = tmp
+                for payload_len in payload_lengths:
+                    # total window must include CRC length; we'll test each CRC type
+                    for crc_name in crc_list:
+                        crc_info = CRC_TABLE.get(crc_name)
+                        if crc_info is None:
+                            continue
+                        crc_len = crc_info['len']
+                        window_len = payload_len + crc_len
+                        if window_len > L_bytes:
+                            continue
+                        # Slide window across bytes
+                        for start in range(0, L_bytes - window_len + 1):
+                            window = b[start:start + window_len]
+                            payload = window[:payload_len]
+                            crc_bytes = window[payload_len:payload_len + crc_len]
+                            # compute crc over payload
+                            try:
+                                val = crc_info['fn'](payload)
+                            except Exception:
+                                # fallback to binascii for crc16
+                                val = crc_info['fn'](payload)
+                            # integer in CRC bytes (big-endian)
+                            crc_int = int.from_bytes(crc_bytes, 'big')
+                            if val == crc_int:
+                                # Save extracted payload
+                                found_any = True
+                                out_name = f"payload_{bitorder}_shift{shift}_{'inv' if inverted else 'ninv'}_{crc_name}_start{start}_plen{payload_len}.bin"
+                                out_path = extracted_dir / out_name
+                                with open(out_path, 'wb') as of:
+                                    of.write(payload)
+                                # record
+                                match = {
+                                    'bitorder': bitorder,
+                                    'shift': int(shift),
+                                    'inverted': bool(inverted),
+                                    'crc': crc_name,
+                                    'start_byte': int(start),
+                                    'payload_len': int(payload_len),
+                                    'crc_len': int(crc_len),
+                                    'out_file': str(out_path.relative_to(sample_dir))
+                                }
+                                summary['matches'].append(match)
+                                if debug:
+                                    logger.debug("[%s] MATCH %s", sample_dir.name, json.dumps(match))
+                                # avoid duplicates: continue scanning but keep recording
+    if not found_any:
+        summary['matches_count'] = 0
+    else:
+        summary['matches_count'] = len(summary['matches'])
+    return summary
 
-        for invert in inversions:
-            b_try = (1 - b_shifted) if invert else b_shifted
-            # pack to bytes
-            byte_stream = bits_to_bytes(b_try, pad_to_byte=True)
-            matches, checked = scan_for_frames_by_crc(
-                byte_stream,
-                min_payload_b=args.min_bytes,
-                max_payload_b=args.max_bytes,
-                crc_candidates=args.crc_set,
-                max_windows=args.max_windows_per_sample
-            )
-            tried += checked
-            if matches:
-                logger.info("  Found %d CRC matches (shift=%+d invert=%s)", len(matches), shift, invert)
-                # persist matches
-                out_dir = sample_dir / 'extracted'
-                out_dir.mkdir(exist_ok=True)
-                meta_list = []
-                for mi, m in enumerate(matches):
-                    fname = f"frame_s{shift:+d}_i{int(invert)}_pos{m['start_byte']}_len{m['total_len']}_{m['crc']}.bin"
-                    out_path = out_dir / fname
-                    with open(out_path, 'wb') as f:
-                        f.write(m['payload'])
-                    meta_list.append({
-                        'file': str(out_path.relative_to(sample_dir)),
-                        'start_byte': m['start_byte'],
-                        'total_len': m['total_len'],
-                        'crc': m['crc'],
-                        'shift': shift,
-                        'inverted': bool(invert)
-                    })
-                # write sample-level metadata
-                with open(sample_dir / 'extracted_meta.json', 'w') as f:
-                    json.dump({'matches': meta_list}, f, indent=2)
-                sample_matches.extend(meta_list)
-            else:
-                logger.debug("  no matches (shift=%+d invert=%s) after checking %d windows", shift, invert, checked)
+# -------------------------
+# High-level run over dataset
+# -------------------------
+def run_phase4_on_root(
+    root: Path,
+    min_bytes: int = 8,
+    max_bytes: int = 128,
+    crc_list: Sequence[str] = ('crc32','crc16','crc16_ibm','crc8'),
+    try_shifts: bool = True,
+    max_shift: int = 8,
+    try_invert: bool = True,
+    bitorder_modes: Sequence[str] = ('msb','lsb'),
+    whitelist_len: Optional[int] = None,
+    align_from_gt: bool = False,
+    alignment_max_shift: int = 16,
+    dump_report: bool = True,
+    debug: bool = False
+) -> Dict[str, Any]:
+    root = Path(root)
+    report = {'root': str(root), 'samples': [], 'summary': {}}
+    samples = sorted([p.parent for p in root.glob('**/rx.npy')])
+    if not samples:
+        logger.error("No samples found under %s", root)
+        return report
 
-            # If user wanted single-match-per-sample behavior, we could stop here; keep scanning by default
-            if args.stop_on_first and sample_matches:
-                break
-        if args.stop_on_first and sample_matches:
-            break
+    for s in samples:
+        logger.info("Phase-4: processing %s", s.relative_to(root))
+        # optionally build aligned version from GT
+        if align_from_gt:
+            # try load decoded_bits and ground_truth_bits
+            decoded_f = None
+            for cand in (s / 'decoded_bits.npy', s / 'bits.npy', s / 'decoded_bits_aligned.npy'):
+                if cand.exists():
+                    decoded_f = cand
+                    break
+            meta_f = s / 'meta.json'
+            if decoded_f and meta_f.exists():
+                try:
+                    decoded = np.load(decoded_f).ravel().astype(np.uint8)
+                    meta = json.loads(meta_f.read_text())
+                    gt = np.array(meta.get('ground_truth_bits', [])).ravel().astype(np.uint8)
+                    if gt.size > 0 and decoded.size > 0:
+                        # evaluate only portion after preamble if available in meta
+                        preamble_len = int(meta.get('preamble_len', 800))
+                        if gt.size > preamble_len:
+                            gt_window = gt[preamble_len: preamble_len + decoded.size]
+                        else:
+                            gt_window = gt[:decoded.size]
+                        shift, inv, best_ber = best_align_simple(decoded, gt_window, max_shift=alignment_max_shift)
+                        if shift is not None:
+                            aligned = apply_alignment(decoded, shift, inv)
+                            np.save(s / 'decoded_bits_aligned.npy', aligned.astype(np.uint8))
+                            logger.info("  Wrote decoded_bits_aligned.npy (shift=%d inv=%s ber=%.3e)", shift, inv, best_ber)
+                except Exception as e:
+                    logger.debug("  align-from-gt failed for %s: %s", s, e)
 
-    return {
-        'sample': str(sample_dir),
-        'found_bits': True,
-        'bits_path': str(bits_path.name),
-        'bits_len': int(bits.size),
-        'tried_windows': int(tried),
-        'matches': sample_matches
-    }
+        res = inspect_and_extract_sample(
+            s,
+            min_bytes=min_bytes,
+            max_bytes=max_bytes,
+            crc_list=crc_list,
+            try_shifts=try_shifts,
+            max_shift=max_shift,
+            try_invert=try_invert,
+            bitorder_modes=bitorder_modes,
+            whitelist_len=whitelist_len,
+            debug=debug
+        )
+        report['samples'].append(res)
 
-# -----------------------
-# CLI / run
-# -----------------------
+    # simple summary
+    total_matches = sum(len(r.get('matches', [])) for r in report['samples'])
+    report['summary']['total_samples'] = len(report['samples'])
+    report['summary']['total_matches'] = total_matches
+
+    if dump_report:
+        out_path = Path.cwd() / 'phase4_report.json'
+        with open(out_path, 'w') as f:
+            json.dump(report, f, indent=2)
+        logger.info("Wrote report to %s (total matches=%d)", out_path, total_matches)
+
+    return report
+
+# -------------------------
+# CLI
+# -------------------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Phase-4 assembler / CRC-sweep helper")
-    p.add_argument("--root", default="cubesat_dataset/phase3_coding", help="Samples root folder")
+    p = argparse.ArgumentParser(description="Phase-4 assembler & CRC extractor")
+    p.add_argument("--root", required=True, help="Root dataset directory (e.g., cubesat_dataset/phase3_coding)")
     p.add_argument("--min-bytes", type=int, default=8, help="Minimum payload bytes to try")
-    p.add_argument("--max-bytes", type=int, default=256, help="Maximum payload bytes to try")
-    p.add_argument("--crc", nargs="+", default=["crc32", "crc16", "crc8"],
-                   help="CRC set to try (choose from crc32 crc16 crc8)")
-    p.add_argument("--try-align", action="store_true", help="Try small bit shifts when scanning (slower)")
-    p.add_argument("--try-align-range", type=int, default=2, help="Shift range +/- when --try-align used")
-    p.add_argument("--try-invert", action="store_true", help="Also try bit inversion sweep")
-    p.add_argument("--stop-on-first", action="store_true", help="Stop searching a sample after first match")
-    p.add_argument("--max-windows-per-sample", type=int, default=200000,
-                   help="Cap on number of sliding windows checked per sample to avoid runaway times")
-    p.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
+    p.add_argument("--max-bytes", type=int, default=128, help="Maximum payload bytes to try")
+    p.add_argument("--crc", action='append', default=None, help="CRC to try (can be repeated). Options: crc32, crc16, crc16_ibm, crc8. Default=all")
+    p.add_argument("--no-shift", action="store_true", help="Do NOT try bit shifts (faster)")
+    p.add_argument("--max-shift", type=int, default=8, help="Max +/- bit shift for search")
+    p.add_argument("--no-invert", action="store_true", help="Do NOT try bit inversion")
+    p.add_argument("--bitorder", choices=['msb','lsb','both','auto'], default='both', help="Bit ordering to try. 'auto' tries msb then lsb and stops on first match")
+    p.add_argument("--whitelist-len", type=int, default=None, help="If provided, only test that payload length (bytes)")
+    p.add_argument("--align-from-gt", action="store_true", help="Attempt generation of decoded_bits_aligned.npy using ground_truth_bits in meta.json")
+    p.add_argument("--align-max-shift", type=int, default=16, help="Max shift for align-from-gt")
+    p.add_argument("--debug", action="store_true", help="Verbose debug logging")
     return p.parse_args()
 
 def main():
     args = parse_args()
-    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
-                        format="%(asctime)s %(levelname)s: %(message)s")
-    logger = logging.getLogger("phase4")
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+    if args.crc:
+        crc_list = args.crc
+    else:
+        crc_list = list(CRC_TABLE.keys())
+    if args.bitorder == 'both':
+        bitorder_modes = ('msb','lsb')
+    elif args.bitorder == 'msb':
+        bitorder_modes = ('msb',)
+    elif args.bitorder == 'lsb':
+        bitorder_modes = ('lsb',)
+    else:  # auto
+        bitorder_modes = ('msb','lsb')  # inspector will try msb then lsb; this script doesn't short-circuit, but you can inspect report
 
-    crc_map = []
-    for c in args.crc:
-        c = c.lower()
-        if c in ("crc32", "crc16", "crc8"):
-            crc_map.append(c if c != "crc16" else "crc16")
-        else:
-            logger.warning("Ignoring unknown crc name: %s", c)
-    args.crc_set = crc_map
-
-    root = Path(args.root)
-    if not root.exists():
-        logger.error("Root folder not found: %s", root)
-        return
-
-    sample_dirs = sorted([p.parent for p in root.glob("**/rx.npy")])  # prefer sample dirs known earlier
-    # also include any directories that have decoded_bits.npy even if rx.npy absent
-    for p in root.glob("**/decoded_bits.npy"):
-        if p.parent not in sample_dirs:
-            sample_dirs.append(p.parent)
-    sample_dirs = sorted(set(sample_dirs))
-
-    logger.info("Found %d candidate sample directories", len(sample_dirs))
-    overall = {'total_samples': 0, 'processed': 0, 'matches_total': 0, 'samples': []}
-
-    for sd in sample_dirs:
-        overall['total_samples'] += 1
-        logger.info("Processing sample: %s", sd)
-        res = process_sample(sd, args, logger)
-        if res.get('found_bits'):
-            overall['processed'] += 1
-        mcount = len(res.get('matches', []))
-        overall['matches_total'] += mcount
-        overall['samples'].append(res)
-
-    # write summary
-    out_report = root / 'phase4_report.json'
-    with open(out_report, 'w') as f:
-        json.dump(overall, f, indent=2)
-    logger.info("Done. Processed %d samples, total matches found %d. Report saved to %s",
-                overall['processed'], overall['matches_total'], out_report)
+    run_phase4_on_root(
+        root=Path(args.root),
+        min_bytes=args.min_bytes,
+        max_bytes=args.max_bytes,
+        crc_list=crc_list,
+        try_shifts=(not args.no_shift),
+        max_shift=args.max_shift,
+        try_invert=(not args.no_invert),
+        bitorder_modes=bitorder_modes,
+        whitelist_len=args.whitelist_len,
+        align_from_gt=args.align_from_gt,
+        alignment_max_shift=args.align_max_shift,
+        dump_report=True,
+        debug=args.debug
+    )
 
 if __name__ == "__main__":
     main()
